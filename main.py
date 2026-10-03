@@ -4,15 +4,19 @@ Clinical Decision Support Prototype (kVp and mAs Estimator)
 """
 
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+import csv
+import io
 import logging
+from pathlib import Path
 import time
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import joblib
 import numpy as np
+import openpyxl
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -174,6 +178,33 @@ class BatchPredictionResult(BaseModel):
     predictions: List[PredictionResult]
 
 
+class FilePatientPrediction(BaseModel):
+    row: int
+    patient_id: Optional[str] = None
+    sex: str
+    age: float
+    weight_kg: float
+    height_m: float
+    chest_cm: float
+    computed_bmi: float
+    bmi_category: str
+    recommended_kvp: int
+    recommended_mas: float
+    predicted_kvp: float
+    predicted_mas: float
+    status: str = "success"
+    error: Optional[str] = None
+
+
+class FilePredictionResponse(BaseModel):
+    status: str = "success"
+    filename: str
+    total_rows: int
+    successful_predictions: int
+    failed_rows: int
+    predictions: List[FilePatientPrediction]
+
+
 # --- Helper Functions ---
 def categorize_bmi(bmi_val: float) -> str:
     if bmi_val < 18.5:
@@ -316,6 +347,187 @@ async def batch_predict_exposure(payload: BatchPatientInput):
     for item in payload.patients:
         results.append(perform_prediction(item))
     return BatchPredictionResult(count=len(results), predictions=results)
+
+
+@app.post("/predict-file", tags=["Inference"])
+async def predict_from_file(
+    file: UploadFile = File(..., description="Upload a CSV (.csv) or Excel (.xlsx) file containing patient records"),
+    download_csv: bool = Query(False, description="If True, downloads the results as an enriched CSV file with predicted kVp & mAs appended"),
+):
+    """
+    Upload a CSV or Excel spreadsheet of patients (e.g. 50+ records) and obtain bulk exposure predictions.
+    Supports standard column headers: sex/gender, age, weight_kg, height_m, chest_cm, (optional id, bmi).
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must have a valid filename.")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in [".csv", ".xlsx", ".xls"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{ext}'. Please upload a CSV (.csv) or Excel (.xlsx) file.",
+        )
+
+    contents = await file.read()
+    records: List[Dict[str, Any]] = []
+
+    if ext == ".csv":
+        try:
+            text = contents.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = contents.decode("latin-1")
+        reader = csv.DictReader(io.StringIO(text))
+        for r in reader:
+            records.append(dict(r))
+    else:
+        # Excel (.xlsx)
+        try:
+            wb = openpyxl.load_workbook(filename=io.BytesIO(contents), data_only=True)
+            sheet = wb.active
+            rows_iter = sheet.iter_rows(values_only=True)
+            header_row = next(rows_iter, None)
+            if not header_row:
+                raise HTTPException(status_code=400, detail="Excel file is empty.")
+            headers = [str(col).strip() if col is not None else f"col_{i}" for i, col in enumerate(header_row)]
+            for row in rows_iter:
+                if any(cell is not None for cell in row):
+                    row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+                    records.append(row_dict)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read Excel file: {str(e)}")
+
+    if not records:
+        raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
+
+    results: List[FilePatientPrediction] = []
+    output_rows: List[Dict[str, Any]] = []
+
+    def get_val(row_dict: dict, *keys):
+        norm = {str(k).strip().lower(): v for k, v in row_dict.items() if k is not None}
+        for k in keys:
+            if k in norm and norm[k] not in (None, ""):
+                return norm[k]
+        return None
+
+    successful = 0
+    failed = 0
+
+    for idx, row in enumerate(records, start=1):
+        pid = get_val(row, "id", "patient_id", "record_id", "patient")
+        sex = get_val(row, "sex", "gender", "patient_sex")
+        age = get_val(row, "age", "patient_age")
+        weight = get_val(row, "weight_kg", "weight", "wt_kg", "wt")
+        height = get_val(row, "height_m", "height", "ht_m", "ht")
+        chest = get_val(row, "chest_cm", "chest", "chest_thickness", "thickness_cm")
+        bmi = get_val(row, "bmi", "body_mass_index")
+
+        if None in (sex, age, weight, height, chest):
+            failed += 1
+            missing = [name for name, val in [("sex", sex), ("age", age), ("weight_kg", weight), ("height_m", height), ("chest_cm", chest)] if val is None]
+            err_msg = f"Missing required columns: {', '.join(missing)}"
+            results.append(
+                FilePatientPrediction(
+                    row=idx,
+                    patient_id=str(pid) if pid is not None else None,
+                    sex=str(sex or "Unknown"),
+                    age=float(age or 0),
+                    weight_kg=float(weight or 0),
+                    height_m=float(height or 0),
+                    chest_cm=float(chest or 0),
+                    computed_bmi=0.0,
+                    bmi_category="Invalid",
+                    recommended_kvp=0,
+                    recommended_mas=0.0,
+                    predicted_kvp=0.0,
+                    predicted_mas=0.0,
+                    status="failed",
+                    error=err_msg,
+                )
+            )
+            continue
+
+        try:
+            p_input = PatientInput(
+                sex=sex,
+                age=float(age),
+                weight_kg=float(weight),
+                height_m=float(height),
+                chest_cm=float(chest),
+                bmi=float(bmi) if bmi is not None else None,
+            )
+            pred = perform_prediction(p_input)
+            successful += 1
+            pred_item = FilePatientPrediction(
+                row=idx,
+                patient_id=str(pid) if pid is not None else str(idx),
+                sex=str(sex),
+                age=p_input.age,
+                weight_kg=p_input.weight_kg,
+                height_m=p_input.height_m,
+                chest_cm=p_input.chest_cm,
+                computed_bmi=pred.computed_bmi,
+                bmi_category=pred.bmi_category,
+                recommended_kvp=pred.recommended_kvp,
+                recommended_mas=pred.recommended_mas,
+                predicted_kvp=pred.predicted_kvp,
+                predicted_mas=pred.predicted_mas,
+                status="success",
+            )
+            results.append(pred_item)
+
+            if download_csv:
+                annotated_row = dict(row)
+                annotated_row["recommended_kvp"] = pred.recommended_kvp
+                annotated_row["recommended_mas"] = pred.recommended_mas
+                annotated_row["predicted_kvp"] = pred.predicted_kvp
+                annotated_row["predicted_mas"] = pred.predicted_mas
+                annotated_row["computed_bmi"] = pred.computed_bmi
+                annotated_row["bmi_category"] = pred.bmi_category
+                output_rows.append(annotated_row)
+
+        except Exception as e:
+            failed += 1
+            results.append(
+                FilePatientPrediction(
+                    row=idx,
+                    patient_id=str(pid) if pid is not None else None,
+                    sex=str(sex),
+                    age=float(age or 0),
+                    weight_kg=float(weight or 0),
+                    height_m=float(height or 0),
+                    chest_cm=float(chest or 0),
+                    computed_bmi=0.0,
+                    bmi_category="Error",
+                    recommended_kvp=0,
+                    recommended_mas=0.0,
+                    predicted_kvp=0.0,
+                    predicted_mas=0.0,
+                    status="failed",
+                    error=str(e),
+                )
+            )
+
+    if download_csv and output_rows:
+        out_stream = io.StringIO()
+        fieldnames = list(output_rows[0].keys())
+        writer = csv.DictWriter(out_stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(output_rows)
+        out_stream.seek(0)
+        return StreamingResponse(
+            io.BytesIO(out_stream.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=predicted_{Path(file.filename).stem}.csv"},
+        )
+
+    return FilePredictionResponse(
+        status="success",
+        filename=file.filename,
+        total_rows=len(records),
+        successful_predictions=successful,
+        failed_rows=failed,
+        predictions=results,
+    )
 
 
 if __name__ == "__main__":
