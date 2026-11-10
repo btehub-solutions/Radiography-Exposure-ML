@@ -1,19 +1,23 @@
 name: Keep-Alive Server Automation
 
 on:
-  workflow_dispatch: # Manual trigger only; automatic 10-minute schedule disabled to stop failure emails
+  schedule:
+    # Runs every 10 minutes to prevent Render free tier from sleeping (inactivity threshold is 15 min)
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Allows manual run anytime from GitHub Actions tab
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Radiography ML Health Endpoint
+        continue-on-error: true
         run: |
           echo "Sending automated ping to keep Render instance warm..."
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://radiography-exposure-ml.onrender.com/health || true)
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 --retry 2 --retry-delay 5 https://radiography-exposure-ml.onrender.com/health || true)
           HTTP_STATUS=${HTTP_STATUS:-000}
           echo "Health check response code: $HTTP_STATUS"
-          if [ "$HTTP_STATUS" -eq 200 ]; then
+          if [ "$HTTP_STATUS" = "200" ]; then
             echo "Server is healthy, warm, and ready for inference."
           else
             echo "Notice: Server returned status $HTTP_STATUS"
